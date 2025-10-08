@@ -1,0 +1,49 @@
+services:
+  mariadb:
+    image: mariadb:10.11
+    container_name: mariadb
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    command:
+      - --skip-name-resolve
+    volumes:
+      - ./data/mariadb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MARIADB_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    restart: unless-stopped
+    networks: [appnet]
+
+  ispconfig:
+    build:
+      context: ./installer/panel
+    container_name: ispconfig
+    env_file: .env
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    volumes:
+      - ./installer/autoinstall.ini.tmpl:/opt/templates/autoinstall.ini.tmpl:ro
+      - ./data/state:/var/lib/ispconfig
+      - ./data/ispconfig:/usr/local/ispconfig
+      - ./data/etc-ispconfig:/etc/ispconfig
+      - ./data/logs/nginx:/var/log/nginx
+      - ./data/logs/ispconfig:/var/log/ispconfig
+      - ./data/acme:/root/.acme.sh
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${PANEL_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${PANEL_PORT:-8080}/login/?v=hc || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+    networks: [appnet]
+
+networks:
+  appnet:
+    driver: bridge
