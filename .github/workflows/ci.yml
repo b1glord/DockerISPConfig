@@ -6,12 +6,102 @@ on:
   pull_request:
 
 jobs:
-  validate:
-    name: Validate Docker Compose
+  full-install:
+    name: Build + Full Install + Smoke
     runs-on: ubuntu-latest
+
+    env:
+      # Panel portlarini sabitle (host tarafinda)
+      HTTP_PORT: "8080"
+      HTTPS_PORT: "8443"
+      PANEL_PORT: "8080"
+
     steps:
-      - name: Check out repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate docker compose configuration
-        run: docker compose -f docker-compose.yml config
+      - name: Ensure docker compose plugin
+        run: |
+          docker --version
+          if ! docker compose version ; then
+            sudo apt-get update
+            sudo apt-get install -y docker-compose-plugin
+          fi
+          docker compose version
+
+      - name: Create .env (from GitHub Secrets)
+        run: |
+          : "${{ secrets.DB_ROOT_PASSWORD?DB_ROOT_PASSWORD secret yok }}"
+          cat > .env <<'EOF'
+          DB_ROOT_PASSWORD=${{ secrets.DB_ROOT_PASSWORD }}
+          HTTP_PORT=${{ env.HTTP_PORT }}
+          HTTPS_PORT=${{ env.HTTPS_PORT }}
+          PANEL_PORT=${{ env.PANEL_PORT }}
+          # Installer’i her kosuda tertemiz yapmak icin:
+          FORCE_FRESH_INSTALL=true
+          EOF
+          echo "[ci] .env hazir"
+
+      - name: Validate compose and save resolved file
+        run: |
+          docker compose --env-file .env -f docker-compose.yml config > compose.resolved.yml
+          grep -q "services:" compose.resolved.yml
+      - name: Upload resolved compose
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-resolved
+          path: compose.resolved.yml
+
+      - name: Build images (no cache)
+        run: docker compose --env-file .env build --no-cache
+
+      - name: Up MariaDB first (wait healthy)
+        run: |
+          docker compose --env-file .env up -d mariadb
+          # healthcheck bekle
+          for i in {1..60}; do
+            st="$(docker inspect --format='{{json .State.Health.Status}}' mariadb | tr -d '"')"
+            if [ "$st" = "healthy" ]; then echo "mariadb healthy"; break; fi
+            sleep 2
+          done
+          [ "$st" = "healthy" ] || (echo "MariaDB not healthy"; docker compose logs mariadb; exit 1)
+
+      - name: Up ISPConfig (run installer)
+        run: |
+          docker compose --env-file .env up -d ispconfig
+
+          echo "[ci] ISPConfig kurulumunu bekliyorum (config.inc.php)..."
+          for i in {1..240}; do
+            if docker exec ispconfig bash -lc 'test -f /usr/local/ispconfig/interface/lib/config.inc.php'; then
+              echo "config.inc.php bulundu"; break
+            fi
+            sleep 2
+          done
+          # HTTP smoke (panel health veya nginx default)
+          curl -fsS "http://127.0.0.1:${PANEL_PORT}/login/?v=hc" || curl -fsS "http://127.0.0.1:${HTTP_PORT}/status" || true
+
+      - name: Show versions (debug)
+        run: |
+          docker exec mariadb mysql -uroot -p"${{ secrets.DB_ROOT_PASSWORD }}" -e "SELECT VERSION();"
+          docker ps
+
+      - name: Collect logs and install artifacts on failure
+        if: failure()
+        run: |
+          mkdir -p ci_artifacts
+          docker compose logs --no-color --timestamps mariadb  > ci_artifacts/mariadb.log  || true
+          docker compose logs --no-color --timestamps ispconfig > ci_artifacts/ispconfig.log || true
+          # autoinstall.ini’yi maskeleyip al
+          docker exec ispconfig bash -lc 'test -f /opt/autoinstall.ini && sed -E "s/(root_password *= *).*/\1<hidden>/I" /opt/autoinstall.ini || true' > ci_artifacts/autoinstall.ini || true
+          # installer stdout yoksa da bir fikir verir
+          docker inspect ispconfig > ci_artifacts/ispconfig.inspect.json || true
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-logs
+          path: ci_artifacts
+
+      - name: Down and clean
+        if: always()
+        run: docker compose down -v
